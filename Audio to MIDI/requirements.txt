@@ -9,3 +9,7 @@ pretty_midi
 mir_eval
 scikit-learn
 soundfile
+# Piano mode (Transkun; pulls PyTorch)
+transkun
+soxr
+moduleconf

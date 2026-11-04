@@ -1,8 +1,9 @@
 -- @description Audio to MIDI
--- @version 1.0
+-- @version 1.1
 -- @author BRYAN
 -- @about
 --   Turns the selected audio items into MIDI on a new track under each one.
+--   Piano uses Transkun, a piano-only model, for notes, velocities and sustain pedal (CC64).
 --   Poly uses Basic Pitch (Spotify's note model, run with ONNX Runtime) for chords, piano,
 --   guitar and mixes. Mono tracks the pitch with pYIN for bass, vocals and leads, and can
 --   add pitch bends. Drums sorts hits into kick / snare / hat. Auto picks one.
@@ -254,7 +255,7 @@ local function parse_notes(path)
   if not f then
     return nil, "No notes file was written."
   end
-  local res = { mode = "?", notes = {}, bends = {}, info = "" }
+  local res = { mode = "?", notes = {}, bends = {}, pedals = {}, info = "" }
   for line in f:lines() do
     local tag = line:sub(1, 2)
     if tag == "N " then
@@ -268,6 +269,12 @@ local function parse_notes(path)
       t, v = tonumber(t), tonumber(v)
       if t and v then
         res.bends[#res.bends + 1] = { t, math.floor(v) }
+      end
+    elseif tag == "P " then
+      local st, en, cc, v = line:match("^P (%S+) (%S+) (%S+) (%S+)")
+      st, en, cc, v = tonumber(st), tonumber(en), tonumber(cc), tonumber(v)
+      if st and en and cc and v then
+        res.pedals[#res.pedals + 1] = { st, en, math.floor(cc), math.floor(v) }
       end
     elseif line:sub(1, 5) == "MODE " then
       res.mode = line:sub(6)
@@ -312,7 +319,7 @@ local function last_folder_descendant_index(tr)
   return n - 1
 end
 
-local MODE_NAME = { poly = "Poly", mono = "Mono", drums = "Drums" }
+local MODE_NAME = { piano = "Piano", poly = "Poly", mono = "Mono", drums = "Drums" }
 
 --- puts the notes on a new track under the item's track; returns ok, err
 local function import_notes(job, opts, res)
@@ -379,6 +386,16 @@ local function import_notes(job, opts, res)
       end
     end
   end
+  local n_ped = 0
+  for _, pd in ipairs(res.pedals) do
+    local st = pos + pd[1] / rate
+    local en = math.min(pos + pd[2] / rate, item_end - 0.001)
+    if st < item_end and en > st then
+      r.MIDI_InsertCC(take, false, false, r.MIDI_GetPPQPosFromProjTime(take, st), 0xB0, 0, pd[3], math.max(64, pd[4]))
+      r.MIDI_InsertCC(take, false, false, r.MIDI_GetPPQPosFromProjTime(take, en), 0xB0, 0, pd[3], 0)
+      n_ped = n_ped + 1
+    end
+  end
   r.MIDI_Sort(take)
 
   if opts.synth and res.mode ~= "drums" then
@@ -392,6 +409,7 @@ local function import_notes(job, opts, res)
     mode = res.mode,
     count = count,
     bends = opts.bends and #res.bends or 0,
+    pedals = n_ped,
     lo = lo,
     hi = hi,
     info = res.info,
@@ -711,7 +729,7 @@ local function load_opts()
     return allowed[v] and v or default
   end
   return {
-    mode = pick("MODE", "auto", { auto = 1, poly = 1, mono = 1, drums = 1 }),
+    mode = pick("MODE", "auto", { auto = 1, piano = 1, poly = 1, mono = 1, drums = 1 }),
     sens = pick("SENS", "normal", { fewer = 1, normal = 1, more = 1 }),
     short = pick("SHORT", "60", { ["30"] = 1, ["60"] = 1, ["120"] = 1 }),
     bends = ext_get("BENDS", "n") == "y",
@@ -801,7 +819,8 @@ echo "Using $PY"
 "$VENV/bin/pip" install -q --upgrade pip
 "$VENV/bin/pip" install --no-deps basic-pitch==0.4.0
 "$VENV/bin/pip" install onnxruntime librosa scipy resampy pretty_midi mir_eval scikit-learn soundfile
-"$VENV/bin/python" -c "import basic_pitch, onnxruntime, librosa; print('ok')"
+"$VENV/bin/pip" install transkun soxr moduleconf
+"$VENV/bin/python" -c "import basic_pitch, onnxruntime, librosa, transkun; print('ok')"
 ]]
   return "VENV=" .. shell_quote(venv) .. "; export VENV; " .. sh
 end
@@ -1015,7 +1034,7 @@ local function header()
   local x, y = im.GetCursorScreenPos(ctx)
   local x2 = caps(dl, x, y + 1, P.ink, "Audio to MIDI", 14, true, 3.2)
   im.DrawList_AddRectFilled(dl, x2 + 8, y + 6, x2 + 13, y + 11, P.acc)
-  caps(dl, x2 + 20, y + 4, P.ink3, "Basic Pitch · pYIN", 9, false, 1.3)
+  caps(dl, x2 + 20, y + 4, P.ink3, "Transkun · Basic Pitch", 9, false, 1.3)
   local cx = x + W - 18
   im.SetCursorScreenPos(ctx, cx, y - 2)
   if im.InvisibleButton(ctx, "##close", 18, 18) then
@@ -1069,7 +1088,7 @@ end
 local function draw_env_error()
   section("Setup")
   if UI.env_err == "venv" then
-    wrapped("First run: this needs a small Python environment (Basic Pitch + librosa, about 300 MB) in\n"
+    wrapped("First run: this needs a Python environment (Basic Pitch, Transkun piano model, librosa; about 1 GB with PyTorch) in\n"
       .. join_path(script_dir(), VENV))
     gap(14)
     if button("##install", "Set up", W, 34, "primary") then
@@ -1111,9 +1130,10 @@ end
 
 local MODE_OPTS = {
   { key = "auto", label = "Auto", sub = "picks one" },
+  { key = "piano", label = "Piano", sub = "+ pedal" },
   { key = "poly", label = "Poly", sub = "chords" },
   { key = "mono", label = "Mono", sub = "one line" },
-  { key = "drums", label = "Drums", sub = "kick snare hat" },
+  { key = "drums", label = "Drums", sub = "kit" },
 }
 
 local function draw_setup()
@@ -1261,6 +1281,7 @@ local function draw_job_detail(job)
     else
       line = line .. "  ·  " .. note_name(res.lo) .. " – " .. note_name(res.hi)
       if res.bends > 0 then line = line .. "  ·  pitch bends" end
+      if res.pedals > 0 then line = line .. "  ·  " .. res.pedals .. " pedal" .. (res.pedals == 1 and "" or "s") end
     end
     txt(dl, x + 12, y, P.ink2, line, 10, W - 12)
     im.Dummy(ctx, W, 12)

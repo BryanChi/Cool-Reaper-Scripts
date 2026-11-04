@@ -5,6 +5,7 @@ Transcribes one stretch of an audio file to notes and writes them as plain text 
 Lua side turns into a MIDI item.
 
 Modes
+  piano  Transkun (piano-only model, MAESTRO): notes, velocity and sustain pedal. Needs torch.
   poly   Basic Pitch (Spotify, ICASSP 2022) through ONNX Runtime: chords, piano, guitar, mixes.
   mono   pYIN pitch track cut into notes: bass, vocals, leads. Can add pitch bends.
   drums  Onsets sorted into kick / snare / hat by band energy (GM 36 / 38 / 42).
@@ -15,6 +16,7 @@ Output (--out), one record per line, times in seconds from --start:
   MODE <mode actually used>
   N <start> <end> <midi pitch> <velocity 1-127>
   B <time> <bend -8192..8191>       (mono with --bends; range +-BEND_RANGE semitones)
+  P <start> <end> <cc> <value>      (piano: pedal held from start to end; cc 64 = sustain)
   INFO <text>
 Progress: "<pct> <message>" in --progress. Exit code in --done when finished.
 """
@@ -418,6 +420,84 @@ def percussive_share(y):
 
 
 # ---------------------------------------------------------------------------------------------
+# piano: Transkun (piano-only model trained on MAESTRO; notes, velocity, sustain pedal)
+
+
+def run_piano(path, start, dur, sens, min_ms):
+    import threading
+
+    import numpy as np
+
+    progress(4, "Loading the piano model")
+    try:
+        import moduleconf
+        import torch
+        import transkun
+    except ImportError as e:
+        raise RuntimeError(
+            "Piano mode needs Transkun. Install it with: .venv-midi/bin/pip install transkun soxr"
+        ) from e
+    import librosa
+
+    d = os.path.join(os.path.dirname(transkun.__file__), "pretrained")
+    cm = moduleconf.parseFromFile(os.path.join(d, "2.0.conf"))
+    TK = cm["Model"].module.TransKun
+    model = TK(conf=cm["Model"].config)
+    ck = torch.load(os.path.join(d, "2.0.pt"), map_location="cpu")
+    model.load_state_dict(ck.get("best_state_dict", ck.get("state_dict")), strict=False)
+    model.eval()
+    torch.set_grad_enabled(False)
+
+    progress(10, "Reading audio")
+    y, _ = librosa.load(path, sr=model.fs, mono=False, offset=max(0.0, start), duration=dur if dur > 0 else None)
+    y = np.asarray(y, dtype=np.float32)
+    if y.ndim == 1:
+        y = y[None, :]
+    y = np.ascontiguousarray(y.T)  # (samples, channels)
+    if y.shape[0] == 0:
+        raise RuntimeError("No audio in the selected range.")
+    secs = y.shape[0] / float(model.fs)
+
+    # the model has no progress hook: creep the bar along while it works
+    done = threading.Event()
+
+    def creep():
+        t0 = time.time()
+        while not done.wait(0.5):
+            frac = 1 - np.exp(-(time.time() - t0) / max(3.0, secs * 0.6))
+            progress(15 + 75 * frac, "Transcribing piano")
+
+    th = threading.Thread(target=creep, daemon=True)
+    th.start()
+    try:
+        est = None
+        if torch.backends.mps.is_available():
+            # Apple GPU when it works; any op it lacks falls back to the CPU run below
+            try:
+                est = model.to("mps").transcribe(torch.from_numpy(y).to("mps"), discardSecondHalf=False)
+            except Exception:  # noqa: BLE001
+                est = None
+                model = model.to("cpu")
+        if est is None:
+            est = model.transcribe(torch.from_numpy(y), discardSecondHalf=False)
+    finally:
+        done.set()
+
+    progress(92, "Building notes")
+    min_vel = int(round(30 - 30 * sens))  # Fewer drops faint notes, More keeps all
+    notes, pedals = [], []
+    for n in est:
+        if n.pitch > 0:
+            if n.end - n.start >= min_ms / 1000.0 * 0.5 and n.velocity >= min_vel:
+                notes.append((float(n.start), float(n.end), int(n.pitch), max(1, min(127, int(n.velocity)))))
+        elif -n.pitch == 64:  # sustain only; its soft-pedal guesses are unreliable
+            pedals.append((float(n.start), float(n.end), int(-n.pitch), max(1, min(127, int(n.velocity)))))
+    notes.sort()
+    pedals.sort()
+    return notes, pedals
+
+
+# ---------------------------------------------------------------------------------------------
 
 
 def main():
@@ -427,7 +507,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--start", type=float, default=0.0)
     ap.add_argument("--dur", type=float, default=0.0)
-    ap.add_argument("--mode", default="auto", choices=["auto", "poly", "mono", "drums"])
+    ap.add_argument("--mode", default="auto", choices=["auto", "piano", "poly", "mono", "drums"])
     ap.add_argument("--sens", type=float, default=0.5, help="0 = fewer notes, 1 = more notes")
     ap.add_argument("--min-ms", type=float, default=60.0)
     ap.add_argument("--low", type=float, default=0.0, help="lowest pitch in Hz (0 = any)")
@@ -443,13 +523,19 @@ def main():
         sens = min(1.0, max(0.0, a.sens))
         lo = a.low or None
         hi = a.high or None
-        progress(2, "Reading audio")
         sr = 22050
-        y = load_audio(a.inp, a.start, a.dur, sr)
         mode = a.mode
         info = []
         bends = []
-        if mode == "auto":
+        pedals = []
+        y = None
+        if mode != "piano":
+            progress(2, "Reading audio")
+            y = load_audio(a.inp, a.start, a.dur, sr)
+        if mode == "piano":
+            notes, pedals = run_piano(a.inp, a.start, a.dur, sens, a.min_ms)
+            info.append("%d pedal presses" % len(pedals))
+        elif mode == "auto":
             progress(5, "Checking the sound")
             ps = percussive_share(y)
             info.append("percussive %.0f%%" % (ps * 100))
@@ -466,7 +552,7 @@ def main():
                     notes, bends = run_mono(y, sr, sens, a.min_ms, lo, hi, a.bends)
         elif mode == "mono":
             notes, bends = run_mono(y, sr, sens, a.min_ms, lo, hi, a.bends)
-        else:
+        elif mode == "drums":
             notes = run_drums(y, sr, sens)
         progress(95, "Writing notes")
         tmp = a.out + ".tmp"
@@ -476,6 +562,8 @@ def main():
                 f.write("N %.5f %.5f %d %d\n" % (st, en, p, v))
             for t, v in bends:
                 f.write("B %.5f %d\n" % (t, v))
+            for st, en, cc, v in pedals:
+                f.write("P %.5f %.5f %d %d\n" % (st, en, cc, v))
             info.append("%.1fs" % (time.time() - t0))
             f.write("INFO %s\n" % ", ".join(info))
         os.replace(tmp, a.out)

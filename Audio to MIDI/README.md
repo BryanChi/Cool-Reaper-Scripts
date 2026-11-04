@@ -6,7 +6,8 @@ Each item gets a new track right under its own with a MIDI item over the same sp
 
 | Mode | Engine | Good for |
 |------|--------|----------|
-| Auto | picks one of the three below | anything |
+| Auto | picks Poly, Mono or Drums | anything |
+| Piano | Transkun (piano-only, trained on MAESTRO) | solo piano: notes, velocities, sustain pedal as CC64 |
 | Poly | Basic Pitch (Spotify, ONNX Runtime) | piano, guitar, chords, mixes |
 | Mono | pYIN pitch tracking | bass, vocals, leads; optional pitch bends (±2 semitones) |
 | Drums | per-band onsets | kick 36 / snare 38 / hat 42 |
@@ -23,7 +24,12 @@ The window offers to set it up on first run; by hand:
     python3 -m venv .venv-midi
     .venv-midi/bin/pip install --no-deps basic-pitch==0.4.0
     .venv-midi/bin/pip install -r requirements.txt
+    .venv-midi/bin/pip install transkun soxr moduleconf   # Piano mode (pulls PyTorch)
 
 `AudioToMidi.py` also works on its own:
 
     .venv-midi/bin/python AudioToMidi.py --in song.wav --out notes.txt --mode auto --bends
+
+Piano vs Poly on a 25 s Salamander Grand render with known notes (onset F1, mir_eval):
+Transkun 0.97 (velocity correlation 0.90), Basic Pitch 0.69 (0.77). Piano inside a full mix does
+worse; split the piano out first (Stem Split, 6 stems).
