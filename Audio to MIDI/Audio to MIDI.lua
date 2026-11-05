@@ -1246,15 +1246,25 @@ local function mini_roll(res)
     lo, hi = math.floor(mid - 6), math.floor(mid + 6)
   end
   local span = hi - lo + 1
-  local rh = math.max(1, math.min(4, (h - 6) / span))
+  -- the pitch axis always fits the box: a wide range (a whole piano) gets
+  -- rows thinner than a pixel; each note is still drawn at least 1 px tall
+  local rh = math.min(4, (h - 6) / span)
+  local nh = math.max(1, rh)
   local top = y + 3 + ((h - 6) - rh * span) / 2
   local len = math.max(0.001, res.length)
+  local x0, x1 = x + 2, x + W - 2
+  im.DrawList_PushClipRect(dl, x + 1, y + 1, x + W - 1, y + h - 1, true)
   for _, n in ipairs(res.preview) do
-    local L = x + 2 + (W - 4) * n[1] / len
-    local R = math.max(L + 1, x + 2 + (W - 4) * math.min(n[2], len) / len)
+    local L = math.max(x0, x0 + (W - 4) * n[1] / len)
+    local R = math.min(x1, math.max(L + 1, x0 + (W - 4) * math.min(n[2], len) / len))
     local T = top + (hi - n[3]) * rh
-    im.DrawList_AddRectFilled(dl, L, T, R, T + rh, alpha(P.acc, 0.35 + 0.65 * n[4] / 127))
+    if T + nh > y + h - 3 then T = y + h - 3 - nh end
+    if T < y + 3 then T = y + 3 end
+    if R > L then
+      im.DrawList_AddRectFilled(dl, L, T, R, T + nh, alpha(P.acc, 0.35 + 0.65 * n[4] / 127))
+    end
   end
+  im.DrawList_PopClipRect(dl)
   im.Dummy(ctx, W, h)
 end
 
