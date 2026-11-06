@@ -535,6 +535,13 @@ def main():
         if mode == "piano":
             notes, pedals = run_piano(a.inp, a.start, a.dur, sens, a.min_ms)
             info.append("%d pedal presses" % len(pedals))
+            if not notes:
+                # not an acoustic piano to the model (electric piano, heavy processing):
+                # fall back to Basic Pitch rather than return nothing
+                info.append("no piano found, used Poly")
+                mode = "poly"
+                progress(50, "No piano found, trying Poly")
+                y = load_audio(a.inp, a.start, a.dur, sr)
         elif mode == "auto":
             progress(5, "Checking the sound")
             ps = percussive_share(y)

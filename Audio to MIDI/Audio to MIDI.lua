@@ -1286,6 +1286,9 @@ local function draw_job_detail(job)
     gap(4)
     local x, y = im.GetCursorScreenPos(ctx)
     local line = (MODE_NAME[res.mode] or res.mode)
+    if (res.info or ""):find("no piano found", 1, true) then
+      line = "No piano found, used Poly"
+    end
     if res.mode == "drums" then
       line = line .. "  ·  kick 36  snare 38  hat 42"
     else
